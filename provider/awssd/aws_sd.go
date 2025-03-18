@@ -268,19 +268,17 @@ func (p *AWSSDProvider) ApplyChanges(ctx context.Context, changes *plan.Changes)
 	// convert updates to delete and create operation if applicable (updates not supported)
 	log.Debug("Converting updates to create/delete operations")
 	creates, deletes := p.updatesToCreates(changes)
+	changes.Delete = append(changes.Delete, deletes...)
+	changes.Create = append(changes.Create, creates...)
 
-	if len(creates) > 0 {
-		log.Debugf("Added %d endpoints to create list from updates", len(creates))
-		changes.Create = append(changes.Create, creates...)
+	// Filter out duplicate IPs
+	if len(changes.Create) > 0 && len(changes.Delete) > 0 {
+		log.Debug("Filtering duplicate IPs between create and delete lists")
+		changes.Delete = p.filterDuplicateIPs(changes.Create, changes.Delete)
 	}
 
-	if len(deletes) > 0 {
-		log.Debugf("Added %d endpoints to delete list from updates", len(deletes))
-		changes.Delete = append(changes.Delete, deletes...)
-	}
-
-	log.Debugf("Final changes to apply - Create: %d, Delete: %d",
-		len(changes.Create), len(changes.Delete))
+	log.Debugf("Final changes to apply - Create: %d (%v), Delete: %d (%v)",
+		len(changes.Create), changes.Create, len(changes.Delete), changes.Delete)
 
 	log.Debug("Fetching namespaces for change application")
 	namespaces, err := p.ListNamespaces(ctx)
@@ -291,7 +289,7 @@ func (p *AWSSDProvider) ApplyChanges(ctx context.Context, changes *plan.Changes)
 	log.Debugf("Found %d namespaces for applying changes", len(namespaces))
 
 	if len(changes.Delete) > 0 {
-		log.Debug("Processing deletions")
+		log.Debugf("Processing deletions %v", changes.Delete)
 		err = p.submitDeletes(ctx, namespaces, changes.Delete)
 		if err != nil {
 			log.Errorf("Failed to submit deletes: %v", err)
@@ -301,7 +299,7 @@ func (p *AWSSDProvider) ApplyChanges(ctx context.Context, changes *plan.Changes)
 	}
 
 	if len(changes.Create) > 0 {
-		log.Debug("Processing creations")
+		log.Debugf("Processing creations %v", changes.Create)
 		err = p.submitCreates(ctx, namespaces, changes.Create)
 		if err != nil {
 			log.Errorf("Failed to submit creates: %v", err)
@@ -316,7 +314,12 @@ func (p *AWSSDProvider) ApplyChanges(ctx context.Context, changes *plan.Changes)
 
 func (p *AWSSDProvider) updatesToCreates(changes *plan.Changes) (creates []*endpoint.Endpoint, deletes []*endpoint.Endpoint) {
 	log.Debug("Converting update operations to create/delete operations")
-	log.Debugf("Processing %d update operations", len(changes.UpdateNew))
+
+	log.Debugf("Processing Create operations %v", changes.Create)
+	log.Debugf("Processing Delete operations %v", changes.Delete)
+	log.Debugf("Processing UpdateNew operations %v", changes.UpdateNew)
+	log.Debugf("Processing UpdateOld operations %v", changes.UpdateOld)
+	log.Debugf("Processing HasChanges operations %v", changes.HasChanges())
 
 	updateNewMap := map[string]*endpoint.Endpoint{}
 	for _, e := range changes.UpdateNew {
@@ -751,7 +754,7 @@ func (p *AWSSDProvider) RegisterInstance(ctx context.Context, service *sdtypes.S
 
 		if p.dryRun {
 			log.Debug("Dry run enabled, skipping actual instance registration")
-			log.Debugf("Would have registered instance with the following configuration:")
+			log.Debug("Would have registered instance with the following configuration:")
 			log.Debugf("  Service ID: %s", *service.Id)
 			log.Debugf("  Instance ID: %s", instanceID)
 			for attrKey, attrVal := range attr {
@@ -949,4 +952,58 @@ func (p *AWSSDProvider) isAWSLoadBalancer(hostname string) bool {
 	matchNlb := sdNlbHostnameRegex.MatchString(hostname)
 
 	return matchElb || matchNlb
+}
+
+// filterDuplicateIPs removes targets from the delete list that exist in the create list to avoid unnecessary operations
+func (p *AWSSDProvider) filterDuplicateIPs(creates, deletes []*endpoint.Endpoint) []*endpoint.Endpoint {
+	log.Debug("Filtering duplicate IPs between create and delete lists")
+
+	// Build a map of all target IPs in the create list for fast lookup
+	createTargets := make(map[string]struct{})
+	for _, create := range creates {
+		for _, target := range create.Targets {
+			log.Debugf("Create target: %s", target)
+			createTargets[target] = struct{}{}
+		}
+	}
+
+	log.Debugf("Total unique create targets: %d", len(createTargets))
+
+	// Remove duplicates from the delete list
+	filteredDeletes := make([]*endpoint.Endpoint, 0, len(deletes))
+
+	for _, delete := range deletes {
+		originalTargets := delete.Targets
+		filteredTargets := make(endpoint.Targets, 0, len(delete.Targets))
+
+		for _, target := range delete.Targets {
+			if _, exists := createTargets[target]; !exists {
+				// Keep targets that don't exist in the create list
+				filteredTargets = append(filteredTargets, target)
+				log.Debugf("Keeping target in delete list: %s", target)
+			} else {
+				log.Debugf("Removing duplicate target from delete list: %s (already in create list)", target)
+			}
+		}
+
+		// Only add endpoints to the filtered list if they still have targets after filtering
+		if len(filteredTargets) > 0 {
+			// Create a new endpoint to avoid modifying the original
+			clone := &endpoint.Endpoint{
+				DNSName:          delete.DNSName,
+				Targets:          filteredTargets,
+				RecordType:       delete.RecordType,
+				RecordTTL:        delete.RecordTTL,
+				Labels:           delete.Labels,
+				ProviderSpecific: delete.ProviderSpecific,
+			}
+			filteredDeletes = append(filteredDeletes, clone)
+			log.Debugf("Endpoint %s: filtered targets from %d to %d", delete.DNSName, len(originalTargets), len(filteredTargets))
+		} else {
+			log.Debugf("Removing endpoint %s from delete list as all targets are duplicates", delete.DNSName)
+		}
+	}
+
+	log.Debugf("Filtered delete list from %d to %d endpoints", len(deletes), len(filteredDeletes))
+	return filteredDeletes
 }
